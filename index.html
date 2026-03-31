@@ -172,17 +172,17 @@
             <div class="metric-card">
               <div class="metric-label">Objective Eval</div>
               <div id="obj-eval" class="metric-value">—</div>
-              <div class="metric-hint">Engine best play</div>
+              <div class="metric-hint">Engine actual eval</div>
             </div>
             <div class="metric-card highlight">
-              <div class="metric-label">Expected Eval (EE)</div>
+              <div class="metric-label">Avg Human Delta</div>
               <div id="exp-eval" class="metric-value">—</div>
-              <div class="metric-hint">Prob-weighted human outcome</div>
+              <div class="metric-hint">Prob-weighted evaluation loss</div>
             </div>
             <div class="metric-card accent">
-              <div class="metric-label" style="font-size:0.6rem;">Net Averaged Loss</div>
-              <div id="delta-eval" class="metric-value">—</div>
-              <div class="metric-hint">Objective − Expected</div>
+              <div class="metric-label">Line Avg BBI</div>
+              <div id="line-avg-eval" class="metric-value">—</div>
+              <div class="metric-hint">Cumulative blunderability</div>
             </div>
           </div>
 
@@ -201,7 +201,7 @@
                   <th>#</th>
                   <th>Move</th>
                   <th>Probability</th>
-                  <th>Post-Move</th>
+                  <th>Next Turn Δ</th>
                 </tr>
               </thead>
               <tbody id="move-table-body">

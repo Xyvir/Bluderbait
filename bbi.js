@@ -511,19 +511,12 @@ async function runPipeline(chess, workerHelper, options = {}) {
     ? rawEvaluated.map(e => ({ ...e, prob: e.prob / searchProbSum }))
     : rawEvaluated;
 
-  // --- Step 4.5: Re-sync Objective Evaluation ---
-  // If individualized move searches found a better result than the root search, use that as the baseline.
-  // This ensures the dashboard doesn't contradict the move list.
-  // White-relative perspective: White wants MAX, Black wants MIN.
-  const bestMoveVal = normalizedEvaluated.length > 0
-    ? normalizedEvaluated.reduce((best, e) => {
-      return (isWhiteTurn ? (e.evalPawns > best) : (e.evalPawns < best)) ? e.evalPawns : best;
-    }, isWhiteTurn ? -30.0 : 30.0)
-    : objectiveEval;
+  // --- Step 4.5: Anchor Objective Evaluation ---
+  // The root search horizon (Depth N) is our immutable truth. Child moves (searched to Depth N-1) 
+  // will perfectly assemble back to exactly this root evaluation.
+  const syncedObjectiveEval = objectiveEval;
 
-  const syncedObjectiveEval = (Math.abs(bestMoveVal - objectiveEval) > 0.05 && !isNaN(bestMoveVal)) ? bestMoveVal : objectiveEval;
-
-  console.log(`[BBI] Objective Eval: ${objectiveEval.toFixed(2)}, Best Move Eval: ${bestMoveVal.toFixed(2)}, Synced: ${syncedObjectiveEval.toFixed(2)}`);
+  console.log(`[BBI] Immutable Objective Eval: ${objectiveEval.toFixed(2)}`);
 
   // --- Step 4.7: SEE Hydration Implementation ---
   // Compare high-SEE moves against Maia's preferred choice (original top probability move)
@@ -734,9 +727,109 @@ async function runPipeline(chess, workerHelper, options = {}) {
   return finalResult;
 }
 
+class AnalyzerQueue {
+  constructor(workerHelper) {
+    this.workerHelper = workerHelper;
+    this.queue = [];
+    this.activeTask = null;
+  }
+
+  async runQueue() {
+    if (this.activeTask || this.queue.length === 0) return;
+    this.activeTask = this.queue.shift();
+
+    try {
+      const testChess = new Chess(this.activeTask.fen);
+      const result = await runPipeline(testChess, this.workerHelper, {
+        depth: this.activeTask.depth,
+        seeThreshold: this.activeTask.seeThreshold,
+        priority: this.activeTask.priority,
+        maxMoves: this.activeTask.maxMoves || 20,
+        onProgress: this.activeTask.onProgress
+      });
+
+      // Retroactive grading for the previous move
+      if (this.activeTask.executedMove && this.activeTask.prevFen) {
+        const dScale = this.activeTask.depth;
+        const sScale = this.activeTask.seeThreshold;
+        const prevKey = getCacheKey(this.activeTask.prevFen, dScale, sScale);
+        let prevCache = await BBICache.get(prevKey);
+
+        if (prevCache) {
+          const move = this.activeTask.executedMove;
+          const uci = move.from + move.to + (move.promotion || '');
+          let mMatch = prevCache.moveTable.find(m => m.uci === uci);
+          if (!mMatch) {
+            mMatch = {
+              uci: uci,
+              san: move.san,
+              from: move.from,
+              to: move.to,
+              piece: move.piece,
+              color: move.color,
+              prob: 0,
+              evalPawns: result.objectiveEval,
+              cpLoss: 0,
+            };
+            prevCache.moveTable.push(mMatch);
+          }
+          mMatch.futureGrade = result.grade;
+          await BBICache.set(prevKey, prevCache);
+        }
+      }
+
+      this.activeTask.resolve(result);
+    } catch (e) {
+      if (e.message !== 'Interrupted') {
+        console.error('[AnalyzerQueue] Error:', e);
+      }
+      this.activeTask.reject(e);
+    } finally {
+      this.activeTask = null;
+      this.runQueue();
+    }
+  }
+
+  analyze(options) {
+    return new Promise((resolve, reject) => {
+      const task = { ...options, resolve, reject };
+
+      if (options.priority) {
+        if (this.activeTask) {
+          this.workerHelper.clearQueue(); // Abort ALL pending queries belonging to the active pipeline
+        }
+        // Discard pending priority tasks to prevent stale UI clicks from queueing up
+        this.queue = this.queue.filter(t => !t.priority);
+        this.queue.unshift(task);
+      } else {
+        this.queue.push(task);
+      }
+      this.runQueue();
+    });
+  }
+
+  clearBackgroundTasks() {
+    this.queue = this.queue.filter(t => {
+      if (!t.priority) {
+        t.reject(new Error('Interrupted'));
+        return false;
+      }
+      return true;
+    });
+  }
+
+  clearAll() {
+    this.queue.forEach(t => t.reject(new Error('Interrupted')));
+    this.queue = [];
+    if (this.activeTask) {
+      this.workerHelper.clearQueue();
+    }
+  }
+}
+
 const BBI_REVISION = '2026-03-26-v8'; // Increment to invalidate old logic/grading caches
 function getCacheKey(fen, depth, seeThreshold) {
   return `${fen}|d${depth}|s${seeThreshold}|${BBI_REVISION}`;
 }
 
-window.BBI = { runPipeline, gradeFromDelta, cpToPawns, WorkerHelper, getCacheKey, Cache: BBICache };
+window.BBI = { AnalyzerQueue, runPipeline, gradeFromDelta, cpToPawns, WorkerHelper, getCacheKey, Cache: BBICache };

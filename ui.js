@@ -158,12 +158,18 @@ const UI = (() => {
     if (absObj > 0.01)      objEl.classList.add('text-white');
     else if (absObj < -0.01) objEl.classList.add('text-black');
 
-    // Expected Eval remains side-to-move relative (standard for "Human Outcome")
+    // Avg Human Delta is the negative of the calculated loss.
+    // e.g. If human loses 0.37 pawns, delta is +0.37. Avg Human Delta = -0.37.
+    const avgDelta = -(delta || 0);
     const expEl = document.getElementById('exp-eval');
-    expEl.textContent = fmtAdv(expectedEval);
-    expEl.className = 'metric-value ' + (expectedEval > 0 ? 'eval-pos' : 'eval-neg');
-
-    document.getElementById('delta-eval').textContent = fmtDelta(delta);
+    
+    if (isNaN(avgDelta)) {
+      expEl.textContent = '---';
+      expEl.className = 'metric-value';
+    } else {
+      expEl.textContent = (Math.abs(avgDelta) < 0.001 ? '=0.00' : (avgDelta >= 0 ? '↑' : '↓') + Math.abs(avgDelta).toFixed(2));
+      expEl.className = 'metric-value ' + (avgDelta <= -0.05 ? 'eval-neg' : 'eval-neutral');
+    }
 
     const gradeEl = document.getElementById('grade-badge');
     gradeEl.innerHTML = `<span class="grade-badge-letter">${grade}</span><span class="grade-badge-suffix">Rank</span>`;
@@ -171,7 +177,7 @@ const UI = (() => {
   }
 
   function clearScorePanel() {
-    ['obj-eval', 'exp-eval', 'delta-eval'].forEach(id => {
+    ['obj-eval', 'exp-eval', 'line-avg-eval'].forEach(id => {
       const el = document.getElementById(id);
       el.textContent = '—';
       if (id === 'obj-eval') {
@@ -209,7 +215,7 @@ const UI = (() => {
       if (row.isPruned) tr.classList.add('pruned-move');
       
       const evalVal = row.relativeDelta;
-      const ev = (Math.abs(evalVal) < 0.001) ? '=0.00' : (evalVal >= 0 ? '↑' : '↓') + Math.abs(evalVal).toFixed(2);
+      const evDelta = (Math.abs(evalVal) < 0.001) ? '=0.00' : (evalVal >= 0 ? '↑' : '↓') + Math.abs(evalVal).toFixed(2);
       
       const heat = probToHeat(row.prob);
       tr.innerHTML = `
@@ -219,7 +225,7 @@ const UI = (() => {
           <div class="prob-bar" style="width:${pct}%; background:${heat}"></div>
           <span class="prob-label">${pct}%</span>
         </td>
-        <td class="eval-cell ${evalVal > 0 ? 'pos' : 'neg'}">${ev}</td>
+        <td class="eval-cell ${evalVal >= -0.005 ? 'neutral' : 'neg'}">${evDelta}</td>
       `;
 
       tr.addEventListener('mouseenter', () => showSingleMoveGhost(row));
@@ -240,13 +246,17 @@ const UI = (() => {
   // -------------------------------------------------------------------------
   function updateStatus() {
     const statusEl = document.getElementById('status-line');
+    const historyLen = chess.history().length;
+    const moveNum = Math.floor(historyLen / 2) + 1;
+    const prefix = chess.turn() === 'w' ? `${moveNum}.` : `${moveNum}...`;
+
     if (chess.in_checkmate()) {
-      statusEl.textContent = `Checkmate! ${chess.turn() === 'w' ? 'Black' : 'White'} wins.`;
+      statusEl.textContent = `${prefix} Checkmate! ${chess.turn() === 'w' ? 'Black' : 'White'} wins.`;
     } else if (chess.in_draw()) {
-      statusEl.textContent = 'Draw!';
+      statusEl.textContent = `${prefix} Draw!`;
     } else {
       const t = chess.turn() === 'w' ? 'White' : 'Black';
-      statusEl.textContent = `${t} to move${chess.in_check() ? ' • Check!' : ''}`;
+      statusEl.textContent = `${prefix} ${t} to move${chess.in_check() ? ' • Check!' : ''}`;
     }
 
     // Add turn class to board-wrapper for perspective styling (Player Perspective mode)

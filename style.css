@@ -5,6 +5,7 @@
 
 /* ---- Reset & Tokens ---- */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+.hidden { display: none !important; }
 
 :root {
   --bg-base:      #0d1117;
@@ -654,6 +655,7 @@ input:checked + .switch-slider:before {
 .metric-value { font-size: 1.5rem; font-weight: 600; font-family: var(--font-mono); color: var(--text-primary); transition: color 0.2s; }
 .metric-value.eval-pos { color: var(--accent-green); text-shadow: 0 0 15px #2ea04340; }
 .metric-value.eval-neg { color: var(--accent-red); text-shadow: 0 0 15px #f8514940; }
+.metric-value.eval-warning { color: var(--accent-amber); text-shadow: 0 0 15px #d2992240; }
 .metric-hint  { font-size: 0.68rem; color: var(--text-muted); }
 
 /* Interpretation line */
