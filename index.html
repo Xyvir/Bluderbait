@@ -127,13 +127,7 @@
       <!-- RIGHT: Score + Heatmap -->
       <section class="score-section">
 
-        <!-- Loading overlay -->
-        <div id="loading-indicator" class="loading-indicator hidden">
-          <div class="progress-track">
-            <div id="progress-fill" class="progress-fill"></div>
-          </div>
-          <span id="progress-text">Initializing...</span>
-        </div>
+        <!-- Loading overlay removed -> Now inline with Heatmap -->
 
         <!-- Score Panel -->
         <div id="score-panel" class="score-panel">
@@ -190,8 +184,15 @@
 
         <!-- Move Heatmap -->
         <div class="heatmap-panel">
-          <div class="heatmap-header">
-            <span class="heatmap-title">Human Move Probabilities</span>
+          <div class="heatmap-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; align-items: center; gap: 15px;">
+              <span class="heatmap-title">Human Move Probabilities</span>
+              <span id="queue-counter" class="hidden" style="font-size: 0.72rem; color: var(--accent-amber); font-weight: 600;">(0 queued)</span>
+              <div id="inline-progress-container" class="hidden" style="display: flex; align-items: center; gap: 8px;">
+                <div class="app-spinner" style="width: 14px; height: 14px; border-width: 2px;"></div>
+                <span id="inline-progress-text" style="font-size: 0.72rem; color: var(--accent-blue); text-transform: uppercase; font-weight: 600; letter-spacing: 0.05em;">Analyzing... 0%</span>
+              </div>
+            </div>
             <span id="source-indicator" class="source-indicator"></span>
           </div>
           <div class="heatmap-scroll">

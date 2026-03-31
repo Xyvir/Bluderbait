@@ -97,22 +97,26 @@ const UI = (() => {
   // Score panel display
   // -------------------------------------------------------------------------
   function showLoading(active, text = 'Calculating...', pct = 0) {
-    document.getElementById('loading-indicator').classList.toggle('hidden', !active);
-    document.getElementById('score-panel').classList.toggle('dimmed', active);
+    const el = document.getElementById('inline-progress-container');
+    if (!el) return;
 
-    const wrapper = document.querySelector('.board-wrapper');
-    if (wrapper) wrapper.classList.toggle('is-evaluating', active);
-
-    if (active) updateProgress(pct, text);
+    if (active) {
+      el.classList.remove('hidden');
+      updateProgress(pct, text);
+    } else {
+      el.classList.add('hidden');
+    }
   }
 
   function updateProgress(pct, text = null) {
-    const fill = document.getElementById('progress-fill');
-    const label = document.getElementById('progress-text');
-    if (fill) fill.style.width = `${pct * 100}%`;
-    if (label) {
-      if (text) label.textContent = text;
-      else label.textContent = pct === 1 ? 'Complete' : `Calculating... (${Math.round(pct * 100)}%)`;
+    const textEl = document.getElementById('inline-progress-text');
+    if (textEl) {
+      const percent = Math.floor(pct * 100);
+      if (text && text !== 'Calculating...' && text !== 'Evaluating position...') {
+        textEl.textContent = text;
+      } else {
+        textEl.textContent = pct >= 0.99 ? 'COMPLETE' : `ANALYZING... ${percent}%`;
+      }
     }
   }
 

@@ -439,7 +439,12 @@ async function runPipeline(chess, workerHelper, options = {}) {
   };
 
   // --- Step 3: Objective Evaluation of current position ---
-  const objResult = await workerHelper.eval(fen, depth, priority);
+  let objResult = await workerHelper.eval(fen, depth, priority);
+  // Background tasks: retry once if interrupted by a foreground priority task
+  if (!objResult && !priority) {
+    console.log('[BBI] Background objective eval interrupted, retrying...');
+    objResult = await workerHelper.eval(fen, depth, priority);
+  }
   
   // --- Step 4.2: Sanity Check ---
   // Ensure the engine result is for the correct position by verifying move legality AND FEN equality.
@@ -483,7 +488,12 @@ async function runPipeline(chess, workerHelper, options = {}) {
     const nextTurn = testChess.turn();
     const nextFen = testChess.fen();
 
-    return workerHelper.eval(nextFen, depth, priority).then(res => {
+    return workerHelper.eval(nextFen, depth, priority).then(async res => {
+      // Background tasks: retry once if interrupted by a foreground priority task
+      if (!res && !priority) {
+        console.log(`[BBI] Background move eval interrupted for ${pair.uci}, retrying...`);
+        res = await workerHelper.eval(nextFen, depth, priority);
+      }
       if (!res) throw new Error('Interrupted');
       tickProgress();
       return {
@@ -732,11 +742,19 @@ class AnalyzerQueue {
     this.workerHelper = workerHelper;
     this.queue = [];
     this.activeTask = null;
+    this.onQueueChange = null;
+  }
+
+  _notify() {
+    if (this.onQueueChange) {
+      this.onQueueChange(this.queue.length + (this.activeTask ? 1 : 0));
+    }
   }
 
   async runQueue() {
     if (this.activeTask || this.queue.length === 0) return;
     this.activeTask = this.queue.shift();
+    this._notify();
 
     try {
       const testChess = new Chess(this.activeTask.fen);
@@ -786,6 +804,7 @@ class AnalyzerQueue {
       this.activeTask.reject(e);
     } finally {
       this.activeTask = null;
+      this._notify();
       this.runQueue();
     }
   }
@@ -796,14 +815,39 @@ class AnalyzerQueue {
 
       if (options.priority) {
         if (this.activeTask) {
-          this.workerHelper.clearQueue(); // Abort ALL pending queries belonging to the active pipeline
+          if (this.activeTask.priority || this.activeTask.isDowngraded) {
+            // Keep interrupted foreground tracks (or downgraded queues) alive in the background
+            const bgTask = { 
+              ...this.activeTask, 
+              priority: false, 
+              isDowngraded: true,
+              resolve: this.activeTask.isDowngraded ? this.activeTask.resolve : () => {}, 
+              reject: this.activeTask.isDowngraded ? this.activeTask.reject : () => {}, 
+              onProgress: null 
+            };
+            this.queue.push(bgTask);
+          }
+          this.workerHelper.interruptActive(); // Only abort the active search, preserve background sub-jobs
         }
-        // Discard pending priority tasks to prevent stale UI clicks from queueing up
-        this.queue = this.queue.filter(t => !t.priority);
+        
+        // Convert any pending priority tasks in the queue into background tasks
+        this.queue.forEach(t => {
+          if (t.priority) {
+            t.priority = false;
+            t.isDowngraded = true;
+            t.reject(new Error('Interrupted'));
+            t.resolve = () => {};
+            t.reject = () => {};
+            t.onProgress = null;
+          }
+        });
+
         this.queue.unshift(task);
       } else {
         this.queue.push(task);
       }
+      
+      this._notify();
       this.runQueue();
     });
   }
@@ -816,6 +860,7 @@ class AnalyzerQueue {
       }
       return true;
     });
+    this._notify();
   }
 
   clearAll() {
@@ -824,6 +869,7 @@ class AnalyzerQueue {
     if (this.activeTask) {
       this.workerHelper.clearQueue();
     }
+    this._notify();
   }
 }
 

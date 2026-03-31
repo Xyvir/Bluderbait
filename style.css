@@ -656,6 +656,14 @@ input:checked + .switch-slider:before {
 .metric-value.eval-pos { color: var(--accent-green); text-shadow: 0 0 15px #2ea04340; }
 .metric-value.eval-neg { color: var(--accent-red); text-shadow: 0 0 15px #f8514940; }
 .metric-value.eval-warning { color: var(--accent-amber); text-shadow: 0 0 15px #d2992240; }
+
+.metric-value.eval-SS { color: #ff007f; text-shadow: 0 0 15px #ff007f40; }
+.metric-value.eval-S { color: #fbbf24; text-shadow: 0 0 15px #fbbf2440; }
+.metric-value.eval-A { color: #34d399; text-shadow: 0 0 15px #34d39940; }
+.metric-value.eval-B { color: #38bdf8; text-shadow: 0 0 15px #38bdf840; }
+.metric-value.eval-C { color: #a371f7; text-shadow: 0 0 15px #a371f740; }
+.metric-value.eval-D { color: var(--text-secondary); text-shadow: none; }
+
 .metric-hint  { font-size: 0.68rem; color: var(--text-muted); }
 
 /* Interpretation line */

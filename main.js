@@ -18,6 +18,18 @@
   const workerHelper = new BBI.WorkerHelper();
   const analyzer = new BBI.AnalyzerQueue(workerHelper);
 
+  analyzer.onQueueChange = (count) => {
+    const el = document.getElementById('queue-counter');
+    if (el) {
+      if (count > 0) {
+        el.textContent = `(${count} pending)`;
+        el.classList.remove('hidden');
+      } else {
+        el.classList.add('hidden');
+      }
+    }
+  };
+
   // Seeding of startpos.json removed to ensure evaluation sync and engine consistency.
 
   // -------------------------------------------------------------------------
@@ -219,22 +231,40 @@
     const avg = totalLoss / count;
 
     let gradeStr = 'D';
-    if (avg >= 5.0) gradeStr = 'SS';
-    else if (avg >= 4.0) gradeStr = 'S';
-    else if (avg >= 3.0) gradeStr = 'A+';
-    else if (avg >= 2.0) gradeStr = 'A';
-    else if (avg >= 1.5) gradeStr = 'A-';
-    else if (avg >= 1.2) gradeStr = 'B+';
-    else if (avg >= 1.0) gradeStr = 'B';
-    else if (avg >= 0.7) gradeStr = 'B-';
-    else if (avg >= 0.5) gradeStr = 'C+';
-    else if (avg >= 0.4) gradeStr = 'C';
-    else if (avg >= 0.2) gradeStr = 'C-';
-    else if (avg >= 0.1) gradeStr = 'D+';
-    else gradeStr = 'D';
+    let rankClass = 'eval-D';
+
+    if (avg >= 15.0) { gradeStr = 'SS'; rankClass = 'eval-SS'; }
+    else if (avg >= 9.0) {
+      if (avg >= 12.0) gradeStr = 'S+';
+      else gradeStr = 'S';
+      rankClass = 'eval-S';
+    }
+    else if (avg >= 5.0) {
+      if (avg >= 7.5) gradeStr = 'A+';
+      else if (avg >= 6.0) gradeStr = 'A';
+      else gradeStr = 'A-';
+      rankClass = 'eval-A';
+    }
+    else if (avg >= 3.0) {
+      if (avg >= 4.3) gradeStr = 'B+';
+      else if (avg >= 3.6) gradeStr = 'B';
+      else gradeStr = 'B-';
+      rankClass = 'eval-B';
+    }
+    else if (avg >= 1.5) {
+      if (avg >= 2.5) gradeStr = 'C+';
+      else if (avg >= 2.0) gradeStr = 'C';
+      else gradeStr = 'C-';
+      rankClass = 'eval-C';
+    }
+    else {
+      if (avg >= 1.0) gradeStr = 'D+';
+      else gradeStr = 'D';
+      rankClass = 'eval-D';
+    }
 
     lineValEl.innerHTML = `<span style="font-size:1.8rem; letter-spacing:-0.05em;">${gradeStr}</span> <span style="font-size:0.8rem; font-weight:normal; color:#8b949e; margin-left:4px;">(↓${avg.toFixed(2)})</span>`;
-    lineValEl.className = 'metric-value ' + (avg >= 2.0 ? 'eval-neg' : (avg >= 1.0 ? 'eval-warning' : 'eval-neutral'));
+    lineValEl.className = 'metric-value ' + rankClass;
   }
 
   // -------------------------------------------------------------------------
@@ -317,7 +347,7 @@
           const currentKey = BBI.getCacheKey(walkChess.fen(), targetDepth, targetSee);
           const cachedCurrent = await BBI.Cache.get(currentKey);
 
-          if (cachedCurrent) {
+          if (cachedCurrent && cachedCurrent.moveTable && cachedCurrent.moveTable.length > 0) {
             needsAnalysis = false;
             prevCache.lastNavigatedUci = uci; // Apply navigation link immediately since it's cached
             
@@ -426,6 +456,8 @@
   // Pipeline orchestration
   // -------------------------------------------------------------------------
 
+  let analyzeDebounceTimer = null;
+
   async function analyzeAndUpdateUI(fen, executedMove, prevFenOverride = null) {
     UI.clearBestMoveArrow();
     UI.clearScorePanel();
@@ -470,29 +502,59 @@
       }
     }
 
-    try {
-      const depth = parseInt(document.getElementById('depth-slider').value, 10);
-      const seeThreshold = parseFloat(document.getElementById('see-slider').value);
+    // --- Instant Cache Check ---
+    // If we already have a full analysis result, render it immediately
+    // without launching a priority pipeline (which would interrupt background work)
+    const depth = parseInt(document.getElementById('depth-slider').value, 10);
+    const seeThreshold = parseFloat(document.getElementById('see-slider').value);
+    const instantKey = BBI.getCacheKey(targetFen, depth, seeThreshold);
+    const instantCached = await BBI.Cache.get(instantKey);
 
-      const result = await analyzer.analyze({
-        fen: targetFen,
-        depth,
-        seeThreshold,
-        priority: true, // Foreground UI interaction has highest priority
-        executedMove,
-        prevFen,
-        onProgress: (pct) => UI.updateProgress(pct)
-      });
-
-      renderBBIResult(result, chess.turn());
+    if (instantCached && instantCached.moveTable && instantCached.moveTable.length > 0) {
+      renderBBIResult(instantCached, chess.turn());
       await updateLineAvgBBI();
-    } catch (e) {
-      if (e.message !== 'Interrupted') console.error('Pipeline error:', e);
-      throw e;
-    } finally {
       UI.showLoading(false);
       updateTrashUI();
+      return;
     }
+
+    // --- Debounced Pipeline Launch ---
+    // When rapidly navigating uncached positions, wait for the user to settle
+    // before launching heavy analysis (prevents cascading priority interrupts)
+    if (analyzeDebounceTimer) clearTimeout(analyzeDebounceTimer);
+
+    return new Promise((resolve, reject) => {
+      analyzeDebounceTimer = setTimeout(async () => {
+        // Re-verify this is still the position the user is viewing
+        if (currentFen !== targetFen) {
+          UI.showLoading(false);
+          resolve();
+          return;
+        }
+
+        try {
+          const result = await analyzer.analyze({
+            fen: targetFen,
+            depth,
+            seeThreshold,
+            priority: true, // Foreground UI interaction has highest priority
+            executedMove,
+            prevFen,
+            onProgress: (pct) => UI.updateProgress(pct)
+          });
+
+          renderBBIResult(result, chess.turn());
+          await updateLineAvgBBI();
+          resolve(result);
+        } catch (e) {
+          if (e.message !== 'Interrupted') console.error('Pipeline error:', e);
+          reject(e);
+        } finally {
+          UI.showLoading(false);
+          updateTrashUI();
+        }
+      }, 150);
+    });
   }
 
   function renderBBIResult(result, currentTurn) {
