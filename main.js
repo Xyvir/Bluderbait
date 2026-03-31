@@ -10,6 +10,7 @@
   let queuedFen = null;
   let currentFen = null;
   let isImporting = false;
+  let analyzeDebounceTimer = null;
 
   // -------------------------------------------------------------------------
   // Instantiate core objects
@@ -456,7 +457,6 @@
   // Pipeline orchestration
   // -------------------------------------------------------------------------
 
-  let analyzeDebounceTimer = null;
 
   async function analyzeAndUpdateUI(fen, executedMove, prevFenOverride = null) {
     UI.clearBestMoveArrow();
