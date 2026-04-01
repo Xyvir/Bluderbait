@@ -288,7 +288,6 @@ async function runPipeline(chess, workerHelper, options = {}) {
     depth = 15,
     maxMoves = 20,   // cap plausible moves to evaluate for speed
     onProgress = null, // callback for progress bar
-    priority = false,
   } = options;
 
   const fen = chess.fen();
@@ -439,12 +438,7 @@ async function runPipeline(chess, workerHelper, options = {}) {
   };
 
   // --- Step 3: Objective Evaluation of current position ---
-  let objResult = await workerHelper.eval(fen, depth, priority);
-  // Background tasks: retry once if interrupted by a foreground priority task
-  if (!objResult && !priority) {
-    console.log('[BBI] Background objective eval interrupted, retrying...');
-    objResult = await workerHelper.eval(fen, depth, priority);
-  }
+  let objResult = await workerHelper.eval(fen, depth);
   
   // --- Step 4.2: Sanity Check ---
   // Ensure the engine result is for the correct position by verifying move legality AND FEN equality.
@@ -488,12 +482,7 @@ async function runPipeline(chess, workerHelper, options = {}) {
     const nextTurn = testChess.turn();
     const nextFen = testChess.fen();
 
-    return workerHelper.eval(nextFen, depth, priority).then(async res => {
-      // Background tasks: retry once if interrupted by a foreground priority task
-      if (!res && !priority) {
-        console.log(`[BBI] Background move eval interrupted for ${pair.uci}, retrying...`);
-        res = await workerHelper.eval(nextFen, depth, priority);
-      }
+    return workerHelper.eval(nextFen, depth).then(async res => {
       if (!res) throw new Error('Interrupted');
       tickProgress();
       return {
@@ -731,8 +720,9 @@ async function runPipeline(chess, workerHelper, options = {}) {
 
   const finalResult = { objectiveEval: syncedObjectiveEval, expectedEval, delta, grade, moveTable, fen, isForcedMate, scoreMate: objResult.score_mate, bestmove: objResult.bestmove, source };
 
-  // Save to cache
-  await BBICache.set(cacheKey, finalResult);
+  // Save to cache (preserve any existing metadata like lastNavigatedUci)
+  const existingCache = await BBICache.get(cacheKey);
+  await BBICache.set(cacheKey, { ...(existingCache || {}), ...finalResult });
 
   return finalResult;
 }
@@ -740,20 +730,196 @@ async function runPipeline(chess, workerHelper, options = {}) {
 class AnalyzerQueue {
   constructor(workerHelper) {
     this.workerHelper = workerHelper;
-    this.queue = [];
-    this.activeTask = null;
-    this.onQueueChange = null;
+    this.queue = [];              // background work items
+    this.activeTask = null;       // currently running task
+    this.currentRequest = null;   // pending foreground request { fen, ..., resolve, reject }
+    this._currentFen = null;      // proximity sort anchor
+    this.gameLineFens = [];       // ordered FENs for proximity sorting
+    this.gameLineMoves = [];      // moves[i] transitions from fens[i] to fens[i+1]
+    this.onQueueChange = null;    // callback(count) for pending counter
+    this.onTaskComplete = null;   // callback(fen) when any task finishes analysis
   }
 
   _notify() {
     if (this.onQueueChange) {
-      this.onQueueChange(this.queue.length + (this.activeTask ? 1 : 0));
+      this.onQueueChange(this.queue.length + (this.activeTask ? 1 : 0) + (this.currentRequest ? 1 : 0));
     }
   }
 
+  /**
+   * Set the full game line for proximity-based background sorting.
+   * @param {string[]} fens - ordered FENs in the game
+   * @param {object[]} moves - moves[i] transitions from fens[i] to fens[i+1]
+   */
+  setGameLine(fens, moves) {
+    this.gameLineFens = fens || [];
+    this.gameLineMoves = moves || [];
+    this._reorderQueue();
+  }
+
+  /**
+   * Update the proximity sort anchor without triggering analysis.
+   * Call this even for cached-position navigation so background work re-sorts.
+   */
+  setCurrentPositionFen(fen) {
+    this._currentFen = fen;
+    this._reorderQueue();
+  }
+
+  /**
+   * Request analysis for the user's current position.
+   * Returns a Promise that resolves with the analysis result.
+   * Interrupts any non-matching active task and re-queues it.
+   */
+  analyzeCurrentPosition(options) {
+    // Cancel any previous pending foreground request
+    if (this.currentRequest) {
+      this.currentRequest.reject(new Error('Interrupted'));
+      this.currentRequest = null;
+    }
+
+    this._currentFen = options.fen;
+
+    // Remove this FEN from the background queue if it's there
+    this.queue = this.queue.filter(t => t.fen !== options.fen);
+
+    return new Promise((resolve, reject) => {
+      const request = { ...options, resolve, reject, isCurrentPosition: true };
+
+      // If the active task IS for the same FEN, hijack its callbacks
+      if (this.activeTask && this.activeTask.fen === options.fen) {
+        this.activeTask.resolve = resolve;
+        this.activeTask.reject = reject;
+        this.activeTask.onProgress = options.onProgress;
+        this.activeTask.isCurrentPosition = true;
+        this._reorderQueue();
+        return;
+      }
+
+      // If there's an active task for a DIFFERENT FEN, interrupt and re-queue it
+      if (this.activeTask) {
+        this._interruptAndRequeue();
+      }
+
+      // Store as the pending foreground request
+      this.currentRequest = request;
+      this._reorderQueue();
+      this._notify();
+      this.runQueue();
+    });
+  }
+
+  /**
+   * Enqueue a background analysis task. Does not interrupt active work.
+   */
+  enqueueBackground(options) {
+    // Skip if already queued or already active
+    if (this.queue.some(t => t.fen === options.fen)) return;
+    if (this.activeTask && this.activeTask.fen === options.fen) return;
+
+    this.queue.push({
+      ...options,
+      resolve: () => {},
+      reject: () => {},
+      onProgress: null,
+      isCurrentPosition: false,
+    });
+    this._reorderQueue();
+    this._notify();
+    this.runQueue();
+  }
+
+  /**
+   * Proximity sort key: lower = higher priority.
+   * Past positions get a 0.4 ply bonus over equidistant future positions.
+   */
+  _proximitySortKey(fen) {
+    if (!this._currentFen || this.gameLineFens.length === 0) return 0;
+    const currentIndex = this.gameLineFens.indexOf(this._currentFen);
+    const taskIndex = this.gameLineFens.indexOf(fen);
+    if (taskIndex === -1) return Infinity;
+    if (currentIndex === -1) return taskIndex; // fallback: process in game order
+
+    const distance = Math.abs(taskIndex - currentIndex);
+    const isPast = taskIndex < currentIndex;
+    return distance - (isPast ? 0.4 : 0);
+  }
+
+  _reorderQueue() {
+    if (this.gameLineFens.length === 0) return;
+    this.queue.sort((a, b) => this._proximitySortKey(a.fen) - this._proximitySortKey(b.fen));
+  }
+
+  _interruptAndRequeue() {
+    if (!this.activeTask) return;
+    const interrupted = this.activeTask;
+    console.log(`[AnalyzerQueue] Interrupting task for ${interrupted.fen.split(' ')[0]}, re-queuing`);
+
+    // Re-queue interrupted task as background work (skip if already queued)
+    if (!this.queue.some(t => t.fen === interrupted.fen)) {
+      this.queue.push({
+        fen: interrupted.fen,
+        depth: interrupted.depth,
+        seeThreshold: interrupted.seeThreshold,
+        executedMove: interrupted.executedMove,
+        prevFen: interrupted.prevFen,
+        maxMoves: interrupted.maxMoves,
+        resolve: () => {},
+        reject: () => {},
+        onProgress: null,
+        isCurrentPosition: false,
+      });
+    }
+
+    // Clear all WorkerHelper jobs (they all belong to the interrupted pipeline)
+    this.workerHelper.clearQueue();
+    // activeTask will be nulled in the finally block when the pipeline throws 'Interrupted'
+  }
+
   async runQueue() {
-    if (this.activeTask || this.queue.length === 0) return;
-    this.activeTask = this.queue.shift();
+    if (this.activeTask) return;
+
+    let nextTask = null;
+
+    // Foreground request always takes absolute priority
+    if (this.currentRequest) {
+      nextTask = this.currentRequest;
+      this.currentRequest = null;
+    } else {
+      // Dequeue background tasks, skipping already-cached positions
+      while (this.queue.length > 0) {
+        const candidate = this.queue[0];
+        const cacheKey = getCacheKey(candidate.fen, candidate.depth, candidate.seeThreshold);
+        const cached = await BBICache.get(cacheKey);
+        if (cached && cached.moveTable && cached.moveTable.length > 0) {
+          // Already fully analyzed — skip
+          this.queue.shift();
+          if (this.onTaskComplete) this.onTaskComplete(candidate.fen);
+          this._notify();
+          continue;
+        }
+        nextTask = this.queue.shift();
+        break;
+      }
+    }
+
+    if (!nextTask) {
+      this._notify();
+      return;
+    }
+
+    // Final cache check for the chosen task (including foreground)
+    const taskCacheKey = getCacheKey(nextTask.fen, nextTask.depth, nextTask.seeThreshold);
+    const taskCached = await BBICache.get(taskCacheKey);
+    if (taskCached && taskCached.moveTable && taskCached.moveTable.length > 0) {
+      nextTask.resolve(taskCached);
+      if (this.onTaskComplete) this.onTaskComplete(nextTask.fen);
+      this._notify();
+      this.runQueue();
+      return;
+    }
+
+    this.activeTask = nextTask;
     this._notify();
 
     try {
@@ -761,47 +927,28 @@ class AnalyzerQueue {
       const result = await runPipeline(testChess, this.workerHelper, {
         depth: this.activeTask.depth,
         seeThreshold: this.activeTask.seeThreshold,
-        priority: this.activeTask.priority,
         maxMoves: this.activeTask.maxMoves || 20,
-        onProgress: this.activeTask.onProgress
+        onProgress: this.activeTask.onProgress,
       });
 
-      // Retroactive grading for the previous move
+      // Retroactive grading: apply this position's grade to the previous position's move table
       if (this.activeTask.executedMove && this.activeTask.prevFen) {
-        const dScale = this.activeTask.depth;
-        const sScale = this.activeTask.seeThreshold;
-        const prevKey = getCacheKey(this.activeTask.prevFen, dScale, sScale);
-        let prevCache = await BBICache.get(prevKey);
-
-        if (prevCache) {
-          const move = this.activeTask.executedMove;
-          const uci = move.from + move.to + (move.promotion || '');
-          let mMatch = prevCache.moveTable.find(m => m.uci === uci);
-          if (!mMatch) {
-            mMatch = {
-              uci: uci,
-              san: move.san,
-              from: move.from,
-              to: move.to,
-              piece: move.piece,
-              color: move.color,
-              prob: 0,
-              evalPawns: result.objectiveEval,
-              cpLoss: 0,
-            };
-            prevCache.moveTable.push(mMatch);
-          }
-          mMatch.futureGrade = result.grade;
-          await BBICache.set(prevKey, prevCache);
-        }
+        await this._applyRetroactiveGrade(result, this.activeTask);
       }
+
+      // Forward retroactive grading: if the NEXT position in the game line is already cached,
+      // apply its grade to THIS position's move table
+      await this._applyForwardRetroactiveGrade(result, this.activeTask);
 
       this.activeTask.resolve(result);
+      if (this.onTaskComplete) this.onTaskComplete(this.activeTask.fen);
     } catch (e) {
-      if (e.message !== 'Interrupted') {
+      if (e.message === 'Interrupted') {
+        console.log('[AnalyzerQueue] Task interrupted, will retry:', this.activeTask?.fen?.split(' ')[0]);
+      } else {
         console.error('[AnalyzerQueue] Error:', e);
+        this.activeTask.reject(e);
       }
-      this.activeTask.reject(e);
     } finally {
       this.activeTask = null;
       this._notify();
@@ -809,66 +956,70 @@ class AnalyzerQueue {
     }
   }
 
-  analyze(options) {
-    return new Promise((resolve, reject) => {
-      const task = { ...options, resolve, reject };
+  async _applyRetroactiveGrade(result, task) {
+    const dScale = task.depth;
+    const sScale = task.seeThreshold;
+    const prevKey = getCacheKey(task.prevFen, dScale, sScale);
+    let prevCache = await BBICache.get(prevKey);
 
-      if (options.priority) {
-        if (this.activeTask) {
-          if (this.activeTask.priority || this.activeTask.isDowngraded) {
-            // Keep interrupted foreground tracks (or downgraded queues) alive in the background
-            const bgTask = { 
-              ...this.activeTask, 
-              priority: false, 
-              isDowngraded: true,
-              resolve: this.activeTask.isDowngraded ? this.activeTask.resolve : () => {}, 
-              reject: this.activeTask.isDowngraded ? this.activeTask.reject : () => {}, 
-              onProgress: null 
-            };
-            this.queue.push(bgTask);
-          }
-          this.workerHelper.interruptActive(); // Only abort the active search, preserve background sub-jobs
-        }
-        
-        // Convert any pending priority tasks in the queue into background tasks
-        this.queue.forEach(t => {
-          if (t.priority) {
-            t.priority = false;
-            t.isDowngraded = true;
-            t.reject(new Error('Interrupted'));
-            t.resolve = () => {};
-            t.reject = () => {};
-            t.onProgress = null;
-          }
-        });
-
-        this.queue.unshift(task);
-      } else {
-        this.queue.push(task);
+    if (prevCache && prevCache.moveTable) {
+      const move = task.executedMove;
+      const uci = move.from + move.to + (move.promotion || '');
+      let mMatch = prevCache.moveTable.find(m => m.uci === uci);
+      if (!mMatch) {
+        mMatch = {
+          uci, san: move.san, from: move.from, to: move.to,
+          piece: move.piece, color: move.color, prob: 0,
+          evalPawns: result.objectiveEval, cpLoss: 0,
+        };
+        prevCache.moveTable.push(mMatch);
       }
-      
-      this._notify();
-      this.runQueue();
-    });
+      mMatch.futureGrade = result.grade;
+      await BBICache.set(prevKey, prevCache);
+    }
+  }
+
+  async _applyForwardRetroactiveGrade(result, task) {
+    if (this.gameLineFens.length === 0 || this.gameLineMoves.length === 0) return;
+    const currentIndex = this.gameLineFens.indexOf(task.fen);
+    if (currentIndex < 0 || currentIndex >= this.gameLineFens.length - 1) return;
+
+    const nextFen = this.gameLineFens[currentIndex + 1];
+    const nextMove = this.gameLineMoves[currentIndex];
+    const dScale = task.depth;
+    const sScale = task.seeThreshold;
+    const nextKey = getCacheKey(nextFen, dScale, sScale);
+    const nextCache = await BBICache.get(nextKey);
+
+    if (nextCache && nextCache.grade && result.moveTable) {
+      const uci = nextMove.from + nextMove.to + (nextMove.promotion || '');
+      let mMatch = result.moveTable.find(m => m.uci === uci);
+      if (mMatch && !mMatch.futureGrade) {
+        mMatch.futureGrade = nextCache.grade;
+        const thisKey = getCacheKey(task.fen, dScale, sScale);
+        await BBICache.set(thisKey, result);
+      }
+    }
   }
 
   clearBackgroundTasks() {
-    this.queue = this.queue.filter(t => {
-      if (!t.priority) {
-        t.reject(new Error('Interrupted'));
-        return false;
-      }
-      return true;
-    });
+    const removed = this.queue.length;
+    this.queue = [];
+    if (removed > 0) console.log(`[AnalyzerQueue] Cleared ${removed} background tasks`);
     this._notify();
   }
 
   clearAll() {
-    this.queue.forEach(t => t.reject(new Error('Interrupted')));
     this.queue = [];
+    if (this.currentRequest) {
+      this.currentRequest.reject(new Error('Interrupted'));
+      this.currentRequest = null;
+    }
     if (this.activeTask) {
       this.workerHelper.clearQueue();
     }
+    this.gameLineFens = [];
+    this.gameLineMoves = [];
     this._notify();
   }
 }

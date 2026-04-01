@@ -10,7 +10,6 @@
   let queuedFen = null;
   let currentFen = null;
   let isImporting = false;
-  let analyzeDebounceTimer = null;
 
   // -------------------------------------------------------------------------
   // Instantiate core objects
@@ -102,6 +101,7 @@
   });
   document.getElementById('btn-clear-cache').addEventListener('click', async () => {
     isImporting = false;
+    analyzer.onTaskComplete = null;
     analyzer.clearAll();
 
     const progContainer = document.getElementById('pgn-progress-container');
@@ -302,140 +302,103 @@
     progSpan.textContent = `Setup...`;
 
     try {
-      // Reset board to the PGN's starting position
       const pgnHeader = tempChess.header();
       const startFen = pgnHeader.FEN || 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 
       UI.showToast(`Analyzing ${history.length} moves...`, 'info');
 
-      // UI.loadFEN updates visual board and global chess state.
-      // We load it silently so it doesn't trigger its own non-silent pipeline which would abort our import.
       const ok = UI.loadFEN(startFen, true);
       if (!ok) throw new Error("Failed to load starting FEN");
 
-      // CRITICAL: Update currentFen so that the first move's retroactive evaluation 
-      // correctly targets the starting position.
       currentFen = startFen;
       isImporting = true;
 
-      // Hydrate the initial starting position so its cache entry exists for the loop.
-      await analyzeAndUpdateUI(startFen, null);
+      // Read current settings
+      const targetDepth = parseInt(document.getElementById('depth-slider').value, 10);
+      const targetSee = parseFloat(document.getElementById('see-slider').value);
 
-      // Use a fresh chess instance to step through
+      // 1. Build the full game line (all FENs + all moves)
+      const allFens = [startFen];
+      const allMoves = [];
       const walkChess = new Chess(startFen);
 
-      let loopPrevFen = startFen;
-
-      // 2. Loop through moves
-      for (let i = 0; i < history.length; i++) {
-        if (!isImporting) throw new Error('Cancelled');
-
-        const move = history[i];
+      for (const move of history) {
         walkChess.move(move);
+        allFens.push(walkChess.fen());
+        allMoves.push(move);
+      }
 
-        // Hydrate silently with sub-move progress using CURRENT slider depth
-        const targetDepth = parseInt(document.getElementById('depth-slider').value, 10);
-        const targetSee = parseFloat(document.getElementById('see-slider').value);
-
-        // Ensure "Next Move" navigation flows correctly
-        const prevKey = BBI.getCacheKey(loopPrevFen, targetDepth, targetSee);
+      // 2. Set up ALL navigation links immediately (so Next button works during analysis)
+      for (let i = 0; i < history.length; i++) {
+        const uci = history[i].from + history[i].to + (history[i].promotion || '');
+        const prevKey = BBI.getCacheKey(allFens[i], targetDepth, targetSee);
         let prevCache = await BBI.Cache.get(prevKey);
-        let needsAnalysis = true;
-        const uci = move.from + move.to + (move.promotion || '');
-
-        if (prevCache) {
-          // Check if this position is already perfectly cached
-          const currentKey = BBI.getCacheKey(walkChess.fen(), targetDepth, targetSee);
-          const cachedCurrent = await BBI.Cache.get(currentKey);
-
-          if (cachedCurrent && cachedCurrent.moveTable && cachedCurrent.moveTable.length > 0) {
-            needsAnalysis = false;
-            prevCache.lastNavigatedUci = uci; // Apply navigation link immediately since it's cached
-            
-            // Apply retroactive grade instantly
-            let mMatch = prevCache.moveTable.find(m => m.uci === uci);
-            if (mMatch) mMatch.futureGrade = cachedCurrent.grade;
-            
-            await BBI.Cache.set(prevKey, prevCache);
-          }
+        if (!prevCache) {
+          prevCache = { fen: allFens[i], moveTable: [] };
         }
+        prevCache.lastNavigatedUci = uci;
+        await BBI.Cache.set(prevKey, prevCache);
+      }
 
-        if (needsAnalysis) {
-          let retries = 3;
-          while (retries > 0 && isImporting) {
-            try {
-              await analyzer.analyze({
-                fen: walkChess.fen(),
-                depth: targetDepth,
-                seeThreshold: targetSee,
-                priority: false, // Background processing
-                executedMove: move,
-                prevFen: loopPrevFen,
-                onProgress: (pct) => {
-                  const currentCount = i + 1;
-                  const totalCount = history.length;
-                  const subPct = Math.floor(pct * 99).toString().padStart(2, '0');
-                  progSpan.textContent = `${currentCount}.${subPct} / ${totalCount}`;
+      // 3. Analyze starting position first (blocking)
+      await analyzeAndUpdateUI(startFen, null);
 
-                  // Smooth out the main bar: current base + sub-progress
-                  const totalPct = ((i + pct) / totalCount) * 100;
-                  progFill.style.width = `${totalPct}%`;
-                }
-              });
-              break; // Success
-            } catch (e) {
-              // If interrupted by a foreground move, wait and retry this position
-              if (e.message === 'Interrupted' && isImporting) {
-                retries--;
-                await new Promise(r => setTimeout(r, 1000)); // Wait for the user's move to finish
-                continue;
-              }
-              throw e;
-            }
-          }
+      // 4. Set game line and enqueue all remaining positions
+      analyzer.setGameLine(allFens, allMoves);
 
-          // Link the navigation string NOW that analysis successfully completed
-          let updatedPrev = await BBI.Cache.get(prevKey);
-          if (updatedPrev) {
-            updatedPrev.lastNavigatedUci = uci;
-            await BBI.Cache.set(prevKey, updatedPrev);
-          }
-          
-          // Give the browser a moment to breathe/render/commit transactions
-          await new Promise(r => setTimeout(r, 500));
-        } else {
-          // Micro-breather for incredibly fast cached imports so UI doesn't freeze completely
-          await new Promise(r => setTimeout(r, 10));
-        }
+      for (let i = 0; i < history.length; i++) {
+        analyzer.enqueueBackground({
+          fen: allFens[i + 1],
+          depth: targetDepth,
+          seeThreshold: targetSee,
+          executedMove: history[i],
+          prevFen: allFens[i],
+        });
+      }
 
-        loopPrevFen = walkChess.fen();
+      // 5. Track progress via onTaskComplete callback
+      const completedFens = new Set();
+      completedFens.add(startFen); // Starting position already done
 
-        // Dynamically refresh the currently viewed board on every background move processed
+      analyzer.onTaskComplete = async (fen) => {
+        if (!isImporting) return;
+
+        completedFens.add(fen);
+        const cachedCount = completedFens.size;
+        const totalCount = allFens.length;
+        const pct = (cachedCount / totalCount) * 100;
+
+        progFill.style.width = `${pct}%`;
+        progSpan.textContent = `${cachedCount} / ${totalCount}`;
+
+        // Refresh currently viewed board
         const cacheKey = BBI.getCacheKey(currentFen, targetDepth, targetSee);
         const cached = await BBI.Cache.get(cacheKey);
-        if (cached) {
+        if (cached && cached.moveTable && cached.moveTable.length > 0) {
           renderBBIResult(cached, currentFen.split(' ')[1]);
           await updateLineAvgBBI();
         }
-
-        // final tick for this move AFTER the safety delay
-        progSpan.textContent = `${i + 1}.00 / ${history.length}`;
-        progFill.style.width = `${((i + 1) / history.length) * 100}%`;
-
-        // Allow navigation to this move immediately as it's analyzed
         UI.updateStatus();
-      }
 
-      UI.showToast('Analysis complete!', 'success');
+        // Check if all done
+        if (cachedCount >= totalCount) {
+          UI.showToast('Analysis complete!', 'success');
+          isImporting = false;
+          analyzer.onTaskComplete = null;
+          if (stopBtn) stopBtn.classList.add('hidden');
+          setTimeout(() => progContainer.classList.add('hidden'), 2000);
+          updateTrashUI();
 
-      // Refresh the UI for the starting position to show hydrated grades/badges
-      await analyzeAndUpdateUI(chess.fen(), null);
+          // Final refresh
+          await analyzeAndUpdateUI(chess.fen(), null);
+        }
+      };
+
     } catch (err) {
       if (err.message !== 'Cancelled' && err.message !== 'Interrupted') {
         console.error('[PGN Import] Crashed:', err);
         UI.showToast('Import interrupted by an error.', 'error');
       }
-    } finally {
       isImporting = false;
       const stopBtn = document.getElementById('btn-stop-import');
       if (stopBtn) stopBtn.classList.add('hidden');
@@ -447,7 +410,9 @@
   document.getElementById('btn-import-pgn').addEventListener('click', importPGN);
   document.getElementById('btn-stop-import').addEventListener('click', () => {
     isImporting = false;
+    analyzer.onTaskComplete = null;
     analyzer.clearBackgroundTasks();
+    analyzer.setGameLine([], []);
     const progContainer = document.getElementById('pgn-progress-container');
     if (progContainer) progContainer.classList.add('hidden');
     UI.showToast('Import cancelled.', 'warning');
@@ -470,6 +435,9 @@
 
     if (!modelLoaded) return;
 
+    // Always tell the analyzer what position we're viewing (for proximity re-sort)
+    analyzer.setCurrentPositionFen(targetFen);
+
     UI.showLoading(true, 'Evaluating position...', 0);
 
     // Immediate Navigation Tracking
@@ -489,7 +457,6 @@
         };
       }
 
-      // Proactively clear priority-true foreground navigation from polluting background pipeline map
       if (!isImporting) {
         const uci = executedMove.from + executedMove.to + (executedMove.promotion || '');
         prevCache.lastNavigatedUci = uci;
@@ -504,7 +471,7 @@
 
     // --- Instant Cache Check ---
     // If we already have a full analysis result, render it immediately
-    // without launching a priority pipeline (which would interrupt background work)
+    // without launching analysis (which would interrupt background work)
     const depth = parseInt(document.getElementById('depth-slider').value, 10);
     const seeThreshold = parseFloat(document.getElementById('see-slider').value);
     const instantKey = BBI.getCacheKey(targetFen, depth, seeThreshold);
@@ -518,43 +485,25 @@
       return;
     }
 
-    // --- Debounced Pipeline Launch ---
-    // When rapidly navigating uncached positions, wait for the user to settle
-    // before launching heavy analysis (prevents cascading priority interrupts)
-    if (analyzeDebounceTimer) clearTimeout(analyzeDebounceTimer);
+    // --- Launch Analysis (no debounce needed — queue handles interruption cleanly) ---
+    try {
+      const result = await analyzer.analyzeCurrentPosition({
+        fen: targetFen,
+        depth,
+        seeThreshold,
+        executedMove,
+        prevFen,
+        onProgress: (pct) => UI.updateProgress(pct)
+      });
 
-    return new Promise((resolve, reject) => {
-      analyzeDebounceTimer = setTimeout(async () => {
-        // Re-verify this is still the position the user is viewing
-        if (currentFen !== targetFen) {
-          UI.showLoading(false);
-          resolve();
-          return;
-        }
-
-        try {
-          const result = await analyzer.analyze({
-            fen: targetFen,
-            depth,
-            seeThreshold,
-            priority: true, // Foreground UI interaction has highest priority
-            executedMove,
-            prevFen,
-            onProgress: (pct) => UI.updateProgress(pct)
-          });
-
-          renderBBIResult(result, chess.turn());
-          await updateLineAvgBBI();
-          resolve(result);
-        } catch (e) {
-          if (e.message !== 'Interrupted') console.error('Pipeline error:', e);
-          reject(e);
-        } finally {
-          UI.showLoading(false);
-          updateTrashUI();
-        }
-      }, 150);
-    });
+      renderBBIResult(result, chess.turn());
+      await updateLineAvgBBI();
+    } catch (e) {
+      if (e.message !== 'Interrupted') console.error('Pipeline error:', e);
+    } finally {
+      UI.showLoading(false);
+      updateTrashUI();
+    }
   }
 
   function renderBBIResult(result, currentTurn) {
